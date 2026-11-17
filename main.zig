@@ -3,53 +3,57 @@ const std = @import("std");
 const allocator = std.heap.page_allocator;
 const fs = std.fs;
 
-const registry_key=  "\"GraphicsSettings_Model_h2986158309\"=hex:";
+const registry_key = "\"GraphicsSettings_Model_h2986158309\"=hex:";
 const fps_header = "7b,22,46,50,53,22,3a,";
 
-
-const Registry = struct{
-    fps:u16,
-    starting:usize,
-    len:usize,
+const Registry = struct {
+    fps: u16,
+    starting: usize,
+    len: usize,
 };
 
-
-pub fn fpsHex(fps:u16)![]const u8{
-    return switch(fps){
+pub fn fpsHex(fps: u16) ![]const u8 {
+    return switch (fps) {
         30 => "33,30,",
         60 => "36,30,",
         120 => "31,32,30,",
         else => error.InvalidFPS,
     };
 }
-pub fn readFile(path: []const u8) ![]u8{
+pub fn readFile(path: []const u8) ![]u8 {
     return fs.cwd().readFileAlloc(
         allocator,
         path,
-        4*1024*1024,
+        4 * 1024 * 1024,
     );
 }
 
-pub fn findRegistry(data: []const u8)?Registry{
-    if(std.mem.indexOf(u8,data,"Cognosphere")==null){
+pub fn findRegistry(data: []const u8) ?Registry {
+    if (std.mem.indexOf(u8, data, "Cognosphere") == null) {
         return null;
     }
     const keypos = std.mem.indexOf(
-        u8,data,registry_key,
+        u8,
+        data,
+        registry_key,
     ) orelse return null;
     const start = keypos + registry_key.len;
-    if(!std.mem.startsWith(u8,data[start..],fps_header,)){
+    if (!std.mem.startsWith(
+        u8,
+        data[start..],
+        fps_header,
+    )) {
         return null;
     }
-    const starting = start+fps_header.len;
-    const values = [_]u16{30,60,120};
-    for (values)|fps|{
+    const starting = start + fps_header.len;
+    const values = [_]u16{ 30, 60, 120 };
+    for (values) |fps| {
         const hex = fpsHex(fps) catch unreachable;
-        if(std.mem.startsWith(u8,data[starting..], hex)){
+        if (std.mem.startsWith(u8, data[starting..], hex)) {
             return .{
-                .fps=fps,
-                .starting=starting,
-                .len=hex.len,
+                .fps = fps,
+                .starting = starting,
+                .len = hex.len,
             };
         }
     }
@@ -136,7 +140,8 @@ fn ask(
 ) ![]const u8 {
     std.debug.print("{s}", .{prompt});
 
-    const line = try reader.takeDelimiterExclusive('\n');
+    const line = (try reader.takeDelimiter('\n')) orelse
+        return error.EndOfStream;
 
     return std.mem.trim(u8, line, " \t\r");
 }
@@ -163,6 +168,7 @@ fn updateRegistry(
     reg: Registry,
     target: u16,
     backup: bool,
+    reader: *std.Io.Reader,
 ) !void {
     const hex = try fpsHex(target);
 
@@ -177,7 +183,6 @@ fn updateRegistry(
     );
     defer allocator.free(patched);
 
-  
     const verified = findRegistry(patched) orelse
         return error.VerificationFailed;
 
@@ -197,12 +202,60 @@ fn updateRegistry(
         );
         defer allocator.free(bak);
 
-        try writeExclusive(bak, data, stat.mode);
+        const exists = blk: {
+            fs.cwd().access(bak, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
 
-        std.debug.print(
-            "[+] Backup created: {s}\n",
-            .{bak},
-        );
+        var should_write = true;
+
+        if (exists) {
+            std.debug.print(
+                "[!] Backup already exists: {s}\n",
+                .{bak},
+            );
+
+            const answer = try ask(
+                reader,
+                "Overwrite existing backup? [y/N] ",
+            );
+
+            should_write =
+                std.ascii.eqlIgnoreCase(answer, "y") or
+                std.ascii.eqlIgnoreCase(answer, "yes");
+
+            if (!should_write) {
+                std.debug.print(
+                    "[*] Keeping existing backup.\n",
+                    .{},
+                );
+            }
+        }
+
+        if (should_write) {
+            if (exists) {
+                // Overwrite existing backup.
+                const file = try fs.cwd().createFile(bak, .{
+                    .truncate = true,
+                    .mode = stat.mode,
+                });
+                defer file.close();
+
+                try file.writeAll(data);
+                try file.sync();
+            } else {
+                // Create a new backup.
+                try writeExclusive(bak, data, stat.mode);
+            }
+
+            std.debug.print(
+                "[+] Backup saved: {s}\n",
+                .{bak},
+            );
+        }
     }
 
     const temp = try std.fmt.allocPrint(
@@ -216,10 +269,8 @@ fn updateRegistry(
 
     errdefer fs.cwd().deleteFile(temp) catch {};
 
-    
     try fs.cwd().rename(temp, path);
 
-    
     const result = try readFile(path);
     defer allocator.free(result);
 
@@ -230,19 +281,18 @@ fn updateRegistry(
         return error.VerificationFailed;
 }
 
-
-pub fn main()!void{
+pub fn main() !void {
     std.debug.print("HSR FPS Unlocker\n", .{});
-    var stdin_buffer:[1024]u8 = undefined;
+    var stdin_buffer: [1024]u8 = undefined;
     var stdin_reader = fs.File.stdin().reader(&stdin_buffer);
     const reader = &stdin_reader.interface;
     std.debug.print("Searching prefix\n", .{});
     const path = try discover() orelse {
         std.debug.print("Registry not found\n", .{});
-        return ;
+        return;
     };
     defer allocator.free(path);
-    const data =try readFile(path);
+    const data = try readFile(path);
     defer allocator.free(data);
     const reg = findRegistry(data) orelse {
         std.debug.print("Cannot find FPS settings\n", .{});
@@ -272,18 +322,15 @@ pub fn main()!void{
         std.debug.print("[-] Invalid option.\n", .{});
         return;
     };
-    if(target==reg.fps){
+    if (target == reg.fps) {
         std.debug.print("Fps already {d}\n", .{reg.fps});
         return;
     }
-    const rsp = try ask(
-        reader,
-        "Create Registry backup? [Y/n]"
-    );
-    const backup = rsp.len == 0 or 
+    const rsp = try ask(reader, "Create Registry backup? [Y/n]");
+    const backup = rsp.len == 0 or
         std.ascii.eqlIgnoreCase(rsp, "y") or
         std.ascii.eqlIgnoreCase(rsp, "yes");
-    
+
     std.debug.print("Updating registry...\n", .{});
     updateRegistry(
         path,
@@ -291,6 +338,7 @@ pub fn main()!void{
         reg,
         target,
         backup,
+        reader,
     ) catch |err| {
         std.debug.print(
             "[-] Update failed: {s}\n",
@@ -304,5 +352,4 @@ pub fn main()!void{
             "[+] You can freely launch HSR.\n",
         .{ reg.fps, target },
     );
-
 }
